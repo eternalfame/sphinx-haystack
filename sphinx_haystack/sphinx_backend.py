@@ -160,14 +160,13 @@ class SphinxSearchBackend(BaseSearchBackend):
         if result_class is None:
             result_class = Document
         query = 'SELECT * FROM {0} WHERE MATCH(%s)'
-        if start_offset and end_offset:
-            query += ' LIMIT {0}, {1}'.format(start_offset, end_offset)
-        if end_offset:
-            query += ' LIMIT {0}'.format(end_offset)
+
         if sort_by:
+            print 'hERE', sort_by
             fields, reverse = [], None
             for field in sort_by:
                 if field.startswith('-'):
+                    field = field[1:]
                     if reverse == False:
                         raise SearchBackendError('Sphinx can only sort by ASC or DESC, not a mix of the two.')
                     reverse = True
@@ -181,7 +180,12 @@ class SphinxSearchBackend(BaseSearchBackend):
                 query += ' DESC'
             else:
                 query += 'ASC'
+        if start_offset and end_offset:
+            query += ' LIMIT {0}, {1}'.format(start_offset, end_offset)
+        if end_offset:
+            query += ' LIMIT {0}'.format(end_offset)
         conn = self._connect()
+        print query.format(self.index_name), (query_string, )
         try:
             curr = conn.cursor()
             rows = curr.execute(query.format(self.index_name), (query_string, ))
@@ -234,16 +238,19 @@ class SphinxSearchQuery(BaseSearchQuery):
         # the base implementation glob them for us.
         from haystack import connections
         if field == 'content':
-            index_fieldname = '@* '
+            index_fieldname = u'@* '
         else:
             index_fieldname = u'@%s ' % connections[self._using].get_unified_index().get_index_fieldname(field)
-        value = value.query_string
+        try:
+            value = value.query_string
+        except Exception as e:
+            pass
         # Build query fragment according to:
         # http://sphinxsearch.com/docs/2.0.2/extended-syntax.html
         filter_types = {
-            'contains': '{0}{1}',
-            'startswith': '{0}^{1}',
-            'exact': '{0}={1}',
+            'contains': u'{0}{1}',
+            'startswith': u'{0}^{1}',
+            'exact': u'{0}={1}',
         }
         query_frag = filter_types.get(filter_type).format(index_fieldname, value)
         return query_frag

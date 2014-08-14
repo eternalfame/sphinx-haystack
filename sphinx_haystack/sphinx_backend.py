@@ -1,3 +1,4 @@
+# encoding: utf-8
 import time
 import datetime
 import logging
@@ -5,14 +6,15 @@ import warnings
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.encoding import force_unicode
-from django.contrib.contenttypes.models import ContentType
-from haystack.backends import BaseEngine, BaseSearchBackend, BaseSearchQuery, log_query
+
+from haystack.backends import BaseEngine, BaseSearchBackend, SearchNode, BaseSearchQuery, log_query
 from haystack.exceptions import MissingDependency, SearchBackendError
 from haystack.utils import get_identifier
 from haystack.constants import ID, DJANGO_CT, DJANGO_ID
-from sphinx_haystack.models import Document
+
 try:
     import MySQLdb
+    from MySQLdb.cursors import DictCursor
 except ImportError:
     raise MissingDependency("The 'sphinx' backend requires the installation of 'MySQLdb'. Please refer to the documentation.")
 try:
@@ -78,18 +80,15 @@ class SphinxSearchBackend(BaseSearchBackend):
         values = []
         # TODO determine fields.
         fields, field_names = [], ['id']
+
         for name, field in index.fields.items():
             fields.append((name, field))
             field_names.append(name)
-        # TODO: use a transaction to remove documents if we are
-        # unsuccessful in saving to Sphinx.
+
         for item in iterable:
-            document, created = Document.objects.get_or_create(
-                content_type = ContentType.objects.get_for_model(item),
-                object_id = item.pk
-            )
             row = index.full_prepare(item)
-            row['id'] = document.pk
+            # Use item pk in Sphinx
+            row['id'] = item.pk
             values.append([row[f] for f in field_names])
         conn = self._connect()
         try:
@@ -105,30 +104,15 @@ class SphinxSearchBackend(BaseSearchBackend):
         finally:
             conn.close()
 
-    def remove(self, obj_or_string):
+    def remove(self, obj):
         """
-        Issue a DELETE query to Sphinx. Deletes a document by it's document ID.
+        Issue a DELETE query to Sphinx. Called on post_delete signal, so, object is already removed
         """
-        if isinstance(obj_or_string, basestring):
-            app_label, model_name, object_id = obj_or_string.split('.')
-            content_type = ContentType.objects.get_by_natural_key(app_label, model_name)
-        else:
-            content_type = ContentType.objects.get_for_model(obj_or_string)
-            object_id = obj_or_string.pk
-        try:
-            document = Document.objects.get(
-                content_type=content_type,
-                object_id=object_id
-            )
-        except Document.DoesNotExist:
-            # Already removed?
-            return
         conn = self._connect()
         try:
             # TODO: use a transaction to delete both atomically.
             curr = conn.cursor()
-            curr.execute('DELETE FROM {0} WHERE id = %s'.format(self.index_name), (document.pk, ))
-            document.delete()
+            curr.execute('DELETE FROM {0} WHERE id = %s'.format(self.index_name), (obj.pk, ))
         finally:
             conn.close()
 
@@ -138,18 +122,8 @@ class SphinxSearchBackend(BaseSearchBackend):
         ID numbers, then deletes them from the index. It does this in a while loop because
         Sphinx will limit the result set to 1,000.
         """
-        conn = self._connect()
-        try:
-            # TODO: use transaction to delete all atomically.
-            curr = conn.cursor()
-            while True:
-                ids = [d.pk for d in Document.objects.all()[:1000]]
-                if not ids:
-                    break
-                curr.execute('DELETE FROM {0} WHERE id IN ({1})'.format(self.index_name, ','.join(map(str, ids))))
-                Document.objects.filter(id__in=ids).delete()
-        finally:
-            conn.close()
+        # TODO: add sphinx version check and try to truncate index
+        raise NotImplementedError('Sphinx rt index truncate is supported since 2.2.0')
 
     @log_query
     def search(self, query_string, sort_by=None, start_offset=0, end_offset=None,
@@ -157,12 +131,38 @@ class SphinxSearchBackend(BaseSearchBackend):
                narrow_queries=None, spelling_query=None, within=None,
                dwithin=None, distance_point=None,
                limit_to_registered_models=None, result_class=None, **kwargs):
-        if result_class is None:
-            result_class = Document
-        query = 'SELECT * FROM {0} WHERE MATCH(%s)'
-
+        """
+        Current implementation works only with MATCH, LIMIT and ORDER BY instructions.
+        Returns list of ids
+        TODO: Make support for facets etc
+        TODO: Make support for getting and return final objects here
+        TODO: Maybe rewrite with sphinxapi instead of mysqldb support?
+        :param query_string:
+        :param sort_by:
+        :param start_offset:
+        :param end_offset:
+        :param fields:
+        :param highlight:
+        :param facets:
+        :param date_facets:
+        :param query_facets:
+        :param narrow_queries:
+        :param spelling_query:
+        :param within:
+        :param dwithin:
+        :param distance_point:
+        :param limit_to_registered_models:
+        :param result_class:
+        :param kwargs:
+        :return:
+        """
+        # TODO: Quick workaround to build an sql string, need more work
+        connector, params = query_string
+        fulltext_search_params = ' AND '.join([x['value'] for x in params if x['type']=='fulltext'])
+        usual_search_params = ' AND '.join([x['value'] for x in params if x['type']=='usual'])
+        query = 'SELECT * FROM {0} WHERE MATCH(%s) {1} {2}'
         if sort_by:
-            print 'hERE', sort_by
+            #print 'hERE', sort_by
             fields, reverse = [], None
             for field in sort_by:
                 if field.startswith('-'):
@@ -184,25 +184,17 @@ class SphinxSearchBackend(BaseSearchBackend):
             query += ' LIMIT {0}, {1}'.format(start_offset, end_offset)
         if end_offset:
             query += ' LIMIT {0}'.format(end_offset)
+        query += ' OPTION ranker=sph04'
         conn = self._connect()
-        print query.format(self.index_name), (query_string, )
         try:
-            curr = conn.cursor()
-            rows = curr.execute(query.format(self.index_name), (query_string, ))
+            curr = conn.cursor(DictCursor)
+            rows = curr.execute(query.format(self.index_name, connector, usual_search_params), (fulltext_search_params, ))
         finally:
             conn.close()
-        results = []
-        while True:
-            row = curr.fetchone()
-            if not row:
-                break
-            id, score = row[:2]
-            document = Document.objects.get(pk=id)
-            document.score = score
-            results.append(document)
+        results = curr.fetchall()
         hits = len(results)
         return {
-            'results': results,
+            'results': [r['id'] for r in results],
             'hits': hits,
         }
 
@@ -220,41 +212,58 @@ class SphinxSearchBackend(BaseSearchBackend):
 
 
 class SphinxSearchQuery(BaseSearchQuery):
-    def build_query(self):
-        # TODO: Any fields that are not "full text" but an attribute in Sphinx, such
-        # as an int or timestamp column needs to be handled via regular WHERE clause syntax:
-        # ... WHERE attr = 1234 ...
-        # However "full text" fields need to be globbed together using the Sphinx Query syntax
-        # inside a MATCH() call:
-        # ... WHERE MATCH('@text keyword') ...
-        # Together this should yield something like:
-        # ... WHERE attr = 1234 AND MATCH('@text keyword') ...
-        return super(SphinxSearchQuery, self).build_query()
 
-    def build_query_fragment(self, field, filter_type, value):
-        # TODO: this probably won't be needed in the future, the functionality here will
-        # be handled in build_query. However, since I am unsure how to determine what type
-        # of field each field is, we will just treat them all as "full text" fields and let
-        # the base implementation glob them for us.
-        from haystack import connections
-        if field == 'content':
-            index_fieldname = u'@* '
+    def build_params(self, *args, **kwargs):
+        params = super(SphinxSearchQuery, self).build_params(*args, **kwargs)
+        return params
+
+    def build_query(self):
+        if not self.query_filter:
+            return u''  #  Shall we match all or none?
         else:
-            index_fieldname = u'@%s ' % connections[self._using].get_unified_index().get_index_fieldname(field)
-        try:
-            value = value.query_string
-        except Exception as e:
-            pass
-        # Build query fragment according to:
-        # http://sphinxsearch.com/docs/2.0.2/extended-syntax.html
+            return self._make_query_from_search_node(self.query_filter)
+
+
+    def _make_query_from_search_node(self, search_node, is_not=False):
+        query_list = []
+        # Let's treat all except 'content' var as non-fulltext fields
+        for child in self.query_filter.children:
+            if isinstance(child, SearchNode):
+                query_list.append(
+                    self._make_query_from_search_node(child, child.negated)
+                )
+            else:
+                expression, term = child
+                field_name, filter_type = search_node.split_expression(expression)
+                constructed_query = self._query_from_term(term, field_name, filter_type, is_not)
+                query_list.append(constructed_query)
+
+        return (search_node.connector, query_list)
+
+    def _query_from_term(self, term, field_name, filter_type, is_not):
+        # TODO: check for fulltext fields (from index definition)
         filter_types = {
-            'contains': u'{0}{1}',
+            'contains': u'{0} {1}',
             'startswith': u'{0}^{1}',
             'exact': u'{0}={1}',
         }
-        query_frag = filter_types.get(filter_type).format(index_fieldname, value)
-        return query_frag
+        if field_name == 'content':
+            # Full text search
+            query = {
+                'type': 'fulltext',
+                'value': u'{} {}'.format(
+                    'NOT' if is_not else '',
+                    filter_types[filter_type].format('@*',term)).strip()
+            }
+        else:
+            query = {
+                'type': 'usual',
+                'value': u'{} {}'.format(
+                    'NOT' if is_not else '',
+                    filter_types[filter_type].format(field_name,term)).strip()
+            }
 
+        return query
 
 class SphinxEngine(BaseEngine):
     backend = SphinxSearchBackend

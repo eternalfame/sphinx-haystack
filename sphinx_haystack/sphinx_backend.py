@@ -1,14 +1,23 @@
 # encoding: utf-8
 import time
+import sys
+import re
 import datetime
 import logging
 import warnings
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.encoding import force_unicode
+from django.utils import six
+try:
+    from django.utils.encoding import force_text
+except ImportError:
+    from django.utils.encoding import force_unicode as force_text
 
 from haystack.backends import BaseEngine, BaseSearchBackend, SearchNode, BaseSearchQuery, log_query
 from haystack.exceptions import MissingDependency, SearchBackendError
+from haystack.constants import VALID_FILTERS, FILTER_SEPARATOR, DEFAULT_ALIAS
+
 from haystack.utils import get_identifier
 from haystack.constants import ID, DJANGO_CT, DJANGO_ID
 
@@ -132,12 +141,12 @@ class SphinxSearchBackend(BaseSearchBackend):
                dwithin=None, distance_point=None,
                limit_to_registered_models=None, result_class=None, **kwargs):
         """
-        Current implementation works only with MATCH, LIMIT and ORDER BY instructions.
+        Current implementation it's better to use SQ to parse query and create SphinxQL string
         Returns list of ids
+        TODO: Support multiple full-text queries
         TODO: Make support for facets etc
         TODO: Make support for getting and return final objects here
-        TODO: Maybe rewrite with sphinxapi instead of mysqldb support?
-        :param query_string:
+        :param query_string: Tuple from query builder, first element is query string and second is full-text query params
         :param sort_by:
         :param start_offset:
         :param end_offset:
@@ -156,11 +165,8 @@ class SphinxSearchBackend(BaseSearchBackend):
         :param kwargs:
         :return:
         """
-        # TODO: Quick workaround to build an sql string, need more work
-        connector, params = query_string
-        fulltext_search_params = ' AND '.join([x['value'] for x in params if x['type']=='fulltext'])
-        usual_search_params = ' AND '.join([x['value'] for x in params if x['type']=='usual'])
-        query = 'SELECT * FROM {0} WHERE MATCH(%s) {1} {2}'
+        query_string, query_params = query_string
+        query = 'SELECT * FROM {0} WHERE {1}'
         if sort_by:
             #print 'hERE', sort_by
             fields, reverse = [], None
@@ -188,7 +194,7 @@ class SphinxSearchBackend(BaseSearchBackend):
         conn = self._connect()
         try:
             curr = conn.cursor(DictCursor)
-            rows = curr.execute(query.format(self.index_name, connector, usual_search_params), (fulltext_search_params, ))
+            rows = curr.execute(query.format(self.index_name, query_string), (query_params, ))
         finally:
             conn.close()
         results = curr.fetchall()
@@ -223,47 +229,72 @@ class SphinxSearchQuery(BaseSearchQuery):
         else:
             return self._make_query_from_search_node(self.query_filter)
 
+    def _escape_string(self, string):
+        return re.sub(u"([=\(\)|\-!@~\"&/\\\^\$\=])", u"\\\1", string)
+
+    def _repr_query_fragment_callback(self, field, filter_type, value):
+        if six.PY3:
+            value = force_text(value)
+        else:
+            value = force_text(value).encode('utf8')
+
+        return u"%s%s%s=%s" % (field, FILTER_SEPARATOR, filter_type, value.encode('utf-8'))
 
     def _make_query_from_search_node(self, search_node, is_not=False):
+        ft_list = []
         query_list = []
         # Let's treat all except 'content' var as non-fulltext fields
-        for child in self.query_filter.children:
+        for child in search_node.children:
             if isinstance(child, SearchNode):
-                query_list.append(
-                    self._make_query_from_search_node(child, child.negated)
-                )
+                query, ft = self._make_query_from_search_node(child, child.negated)
+                query_list.append(query)
+                ft_list.append(ft or [])
             else:
                 expression, term = child
                 field_name, filter_type = search_node.split_expression(expression)
-                constructed_query = self._query_from_term(term, field_name, filter_type, is_not)
-                query_list.append(constructed_query)
-
-        return (search_node.connector, query_list)
+                query, ft = self._query_from_term(term, field_name, filter_type, is_not)
+                query_list.append(query)
+                ft_list.append(ft or [])
+        return u' {} '.format(search_node.connector).join(query_list), u' '.join(filter(None, ft_list))
 
     def _query_from_term(self, term, field_name, filter_type, is_not):
         # TODO: check for fulltext fields (from index definition)
         filter_types = {
             'contains': u'{0} {1}',
-            'startswith': u'{0}^{1}',
+            'not_contains': u'{0} -{1}',
+            'startswith': u'{0} ^{1}',
+            'endswith': u'{0} {1}$',
             'exact': u'{0}={1}',
+            'not_exact': u'{0}!={1}'
         }
+        filter_type = 'not_{}'.format(filter_type) if is_not else filter_type
         if field_name == 'content':
             # Full text search
+            if isinstance(term, basestring):
+                # Escape string value
+                term = self._escape_string(term)
+            else:
+                # Call prepare() method of haystack Input type since it's not a string
+                try:
+                    term = term.prepare()
+                except:
+                    pass
             query = {
                 'type': 'fulltext',
-                'value': u'{} {}'.format(
-                    'NOT' if is_not else '',
-                    filter_types[filter_type].format('@*',term)).strip()
+                'value': u'{}'.format(
+                    filter_types[filter_type].format(u'@*', term)).strip()
             }
         else:
             query = {
                 'type': 'usual',
-                'value': u'{} {}'.format(
-                    'NOT' if is_not else '',
-                    filter_types[filter_type].format(field_name,term)).strip()
+                'value': u'{}'.format(
+                    filter_types[filter_type].format(field_name, term)).strip()
             }
 
-        return query
+        if query['type'] == 'fulltext':
+            return (u'MATCH(%s)', query['value'])
+        else:
+            return (query['value'], None)
 
 class SphinxEngine(BaseEngine):
     backend = SphinxSearchBackend

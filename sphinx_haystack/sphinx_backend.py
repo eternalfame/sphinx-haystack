@@ -1,11 +1,13 @@
 # encoding: utf-8
 import time
 import sys
+import math
 import re
 import datetime
 import logging
 import warnings
 from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.encoding import force_unicode
 from django.utils import six
@@ -14,9 +16,10 @@ try:
 except ImportError:
     from django.utils.encoding import force_unicode as force_text
 
-from haystack.backends import BaseEngine, BaseSearchBackend, SearchNode, BaseSearchQuery, log_query
+from haystack.backends import BaseEngine, BaseSearchBackend, SearchNode, BaseSearchQuery, log_query, SearchResult
 from haystack.exceptions import MissingDependency, SearchBackendError
 from haystack.constants import VALID_FILTERS, FILTER_SEPARATOR, DEFAULT_ALIAS
+from haystack import connections
 
 from haystack.utils import get_identifier
 from haystack.constants import ID, DJANGO_CT, DJANGO_ID
@@ -115,11 +118,10 @@ class SphinxSearchBackend(BaseSearchBackend):
 
     def remove(self, obj):
         """
-        Issue a DELETE query to Sphinx. Called on post_delete signal, so, object is already removed
+        Issue a DELETE query to Sphinx. Doesn't check if object is already removed
         """
         conn = self._connect()
         try:
-            # TODO: use a transaction to delete both atomically.
             curr = conn.cursor()
             curr.execute('DELETE FROM {0} WHERE id = %s'.format(self.index_name), (obj.pk, ))
         finally:
@@ -141,11 +143,12 @@ class SphinxSearchBackend(BaseSearchBackend):
                dwithin=None, distance_point=None,
                limit_to_registered_models=None, result_class=None, **kwargs):
         """
-        Current implementation it's better to use SQ to parse query and create SphinxQL string
-        Returns list of ids
+        Current implementation
+        Made support for some spatial functions e.g. dwithin
+        Return list of SearchResult objects
         TODO: Support multiple full-text queries
         TODO: Make support for facets etc
-        TODO: Make support for getting and return final objects here
+
         :param query_string: Tuple from query builder, first element is query string and second is full-text query params
         :param sort_by:
         :param start_offset:
@@ -166,9 +169,21 @@ class SphinxSearchBackend(BaseSearchBackend):
         :return:
         """
         query_string, query_params = query_string
-        query = 'SELECT * FROM {0} WHERE {1}'
+        selectors = self._get_fields() if not fields else fields.split(',')
+        query = 'SELECT {0} FROM {1} WHERE {2}'
+
+        if dwithin:
+            # Since sphinx does not support single field coordinates,
+            # we suggest that we have (latitude, longitude) pair of fields in index
+            # and return is_near as boolean parameter
+            latitude, longitude = dwithin['point'].get_coords()
+            selectors.append('GEODIST({0}, {1}, latitude, longitude) < {2} as is_near'.format(
+                math.radians(latitude),
+                math.radians(longitude),
+                dwithin['distance'].m
+            ))
+
         if sort_by:
-            #print 'hERE', sort_by
             fields, reverse = [], None
             for field in sort_by:
                 if field.startswith('-'):
@@ -185,23 +200,67 @@ class SphinxSearchBackend(BaseSearchBackend):
             if reverse:
                 query += ' DESC'
             else:
-                query += 'ASC'
+                query += ' ASC'
         if start_offset and end_offset:
             query += ' LIMIT {0}, {1}'.format(start_offset, end_offset)
         if end_offset:
             query += ' LIMIT {0}'.format(end_offset)
         query += ' OPTION ranker=sph04'
+        query_params = (query_params, ) if query_params else tuple()
         conn = self._connect()
         try:
             curr = conn.cursor(DictCursor)
-            rows = curr.execute(query.format(self.index_name, query_string), (query_params, ))
+            rows = curr.execute(query.format(', '.join(selectors), self.index_name, query_string).replace('text', '*'), query_params)
+        except Exception as e:
+            self.log.error(str(e))
+            raise e
         finally:
             conn.close()
         results = curr.fetchall()
-        hits = len(results)
+        return self._process_results(
+            results,
+            result_class=result_class,
+        )
+
+
+    def _get_fields(self):
+        model, app_label, model_name = self._get_indexed_model()
+        unified_index = connections[self.connection_alias].get_unified_index()
+        return unified_index.indexes[model].fields.keys()
+
+
+    def _get_indexed_model(self):
+        model, app_label, model_name = None, '', ''
+
+        unified_index = connections[self.connection_alias].get_unified_index()
+        indexed_models = unified_index.get_indexed_models()
+
+        # XXX: Name convention - index named as modelname_index
+        index_model_name = self.index_name.split('_')[0]
+        for model in indexed_models:
+            if model.__name__.lower() == index_model_name:
+                ct = ContentType.objects.get_for_model(model)
+                app_label = ct.app_label
+                model_name = model.__name__
+                break
+        return model, app_label, model_name
+
+    def _process_results(self, raw_results, result_class=None):
+        if not result_class:
+            result_class = SearchResult
+
+        hits = len(raw_results) or 0
+
+        index_model, app_label, model_name = self._get_indexed_model()
+
+        results = []
+        for result in raw_results:
+            results.append(result_class(
+                app_label, model_name, result['id'], 0, **result
+            ))
         return {
-            'results': [r['id'] for r in results],
-            'hits': hits,
+            'results': results,
+            'hits': 0
         }
 
     def prep_value(self, value):
@@ -265,7 +324,9 @@ class SphinxSearchQuery(BaseSearchQuery):
             'startswith': u'{0} ^{1}',
             'endswith': u'{0} {1}$',
             'exact': u'{0}={1}',
-            'not_exact': u'{0}!={1}'
+            'not_exact': u'{0}!={1}',
+            'in': u'{0} IN ({1})',
+            'not_in': u'{0} NOT IN ({1})'
         }
         filter_type = 'not_{}'.format(filter_type) if is_not else filter_type
         if field_name == 'content':
@@ -285,6 +346,10 @@ class SphinxSearchQuery(BaseSearchQuery):
                     filter_types[filter_type].format(u'@*', term)).strip()
             }
         else:
+            if isinstance(term, list):
+                term = u','.join(map(lambda i: str(i), term))
+            elif isinstance(term, bool):
+                term = int(term)
             query = {
                 'type': 'usual',
                 'value': u'{}'.format(

@@ -129,12 +129,19 @@ class SphinxSearchBackend(BaseSearchBackend):
 
     def clear(self, models=[], commit=True):
         """
-        Clears all contents from index. This method iteratively gets a list of document
-        ID numbers, then deletes them from the index. It does this in a while loop because
-        Sphinx will limit the result set to 1,000.
+        Clears all contents from index.
         """
-        # TODO: add sphinx version check and try to truncate index
-        raise NotImplementedError('Sphinx rt index truncate is supported since 2.2.0')
+        conn = self._connect()
+        #TODO: if conn._server_version < (2,1) make a while loop to delete whole index
+        try:
+            curr = conn.cursor(DictCursor)
+            result = curr.execute('TRUNCATE RTINDEX {0}'.format(self.index_name))
+        except Exception as e:
+            self.log.error(str(e))
+            raise e
+        finally:
+            conn.close()
+        return True
 
     @log_query
     def search(self, query_string, sort_by=None, start_offset=0, end_offset=None,

@@ -50,12 +50,17 @@ class SphinxSearchBackend(BaseSearchBackend):
         # Parse from server banner "Server version: 1.10-dev (r2153)"
         super(SphinxSearchBackend, self).__init__(connection_alias, **connection_options)
         self.log = logging.getLogger('haystack')
-        self.conn_kwargs = {
-            'host': connection_options.get('HOST', DEFAULT_HOST),
-            'port': connection_options.get('PORT', DEFAULT_PORT),
-        }
-        if self.conn_kwargs.get('host') == 'localhost':
-            self.log.warning('Using the host \'localhost\' will connect via the MySQL socket. Sphinx listens on a TCP socket.')
+        if connection_options.get('UNIX_SOCKET'):
+            self.conn_kwargs = {
+                'unix_socket': connection_options['UNIX_SOCKET']
+            }
+        else:
+            self.conn_kwargs = {
+                'host': connection_options.get('HOST', DEFAULT_HOST),
+                'port': connection_options.get('PORT', DEFAULT_PORT),
+            }
+            if self.conn_kwargs.get('host') == 'localhost':
+                self.log.warning('Using the host \'localhost\' will connect via the MySQL socket. Sphinx listens on a TCP socket.')
         try:
             self.index_name = connection_options['INDEX_NAME']
         except KeyError, e:
@@ -81,9 +86,7 @@ class SphinxSearchBackend(BaseSearchBackend):
         return value
 
     def _connect(self):
-        conn = MySQLdb.connect(**self.conn_kwargs)
-        conn.set_character_set('utf8')
-        return conn
+        return MySQLdb.connect(**self.conn_kwargs)
 
     def update(self, index, iterable):
         """

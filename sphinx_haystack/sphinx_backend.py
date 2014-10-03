@@ -81,7 +81,9 @@ class SphinxSearchBackend(BaseSearchBackend):
         return value
 
     def _connect(self):
-        return MySQLdb.connect(**self.conn_kwargs)
+        conn = MySQLdb.connect(**self.conn_kwargs)
+        conn.set_character_set('utf8')
+        return conn
 
     def update(self, index, iterable):
         """

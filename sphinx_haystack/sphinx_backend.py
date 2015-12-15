@@ -90,7 +90,7 @@ class SphinxSearchBackend(BaseSearchBackend):
         conn.set_character_set('utf8')
         return conn
 
-    def update(self, index, iterable):
+    def update(self, index, iterable, commit=None):
         """
         Issue a REPLACE INTO query to Sphinx. This will either insert or update
         a document in the index. If the document ID exists, an update is performed.
